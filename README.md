@@ -84,8 +84,8 @@ If you use **PRISM** in your research or software, please cite our work:
 @inproceedings{lu2026prism,
   title={PRISM: An Efficient GPU-Based Lossy Compression Framework for Progressive Data Retrieval with Multi-Level Interpolation},
   author={Lu, Bing and Liu, Zedong and Zhao, Hairui and Luo, Dejun and Huang, Wenjing and Gu, Yida and Liu, Jinyang and Tan, Guangming and Tao, Dingwen},
-  booktitle={Proceedings of the 31st {ACM} {SIGPLAN} Annual Symposium on Principles and Practice of Parallel Programming, PPoPP 2026, Sydney, Australia, January 31-February 4, 2026},
-  year={2026},
-  DOI={}
+  booktitle={Proceedings of the 31st ACM SIGPLAN Annual Symposium on Principles and Practice of Parallel Programming},
+  pages={164--176},
+  year={2026}
 }
 ```
