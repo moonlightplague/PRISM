@@ -109,9 +109,15 @@ void Bitplane::bitplane_malloc() {
     calculate_aligned_buffer_size(8);
 
     cudaMalloc(&aligned_strides_d, sizeof(int) * 4);
+    cudaMalloc(&prefix_sum_d, sizeof(int) * 4);
+    cudaMalloc(&aligned_prefix_sum_d, sizeof(int) * 4);
+
     cudaMalloc(&d, aligned_size);
     cudaMemset(d, 0, aligned_size);
+
     cudaMemcpy(aligned_strides_d, aligned_strides, sizeof(int) * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(prefix_sum_d, prefix_nums, sizeof(int) * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(aligned_prefix_sum_d, aligned_prefix_nums, sizeof(int) * 4, cudaMemcpyHostToDevice);
 }
 
 void Bitplane::calculate_aligned_buffer_size(size_t alignment = 8) {
@@ -119,11 +125,34 @@ void Bitplane::calculate_aligned_buffer_size(size_t alignment = 8) {
     const int segments_per_level = 32;
     aligned_size = 0;
     
-    for(int level = 0; level < LEVEL; ++level) {
-        size_t segment_size = strides[level];
-        aligned_strides[level] = ((segment_size + alignment - 1) / alignment) * alignment;
-        aligned_size += aligned_strides[level] * segments_per_level;
+    size_t segment_size = strides[3];
+    aligned_strides[3] = ((segment_size + alignment - 1) / alignment) * alignment;
+
+    for (int l = LEVEL - 1; l >=0; --l) {
+        size_t segment_size = strides[l];
+        aligned_strides[l] = ((segment_size + alignment - 1) / alignment) * alignment;
+        aligned_prefix_nums[l] = aligned_strides[l] * segments_per_level;
+        aligned_size += aligned_prefix_nums[l];
     }
+    aligned_prefix_nums[0] =  aligned_prefix_nums[1] +  aligned_prefix_nums[2] +  aligned_prefix_nums[3];
+    aligned_prefix_nums[1] =  aligned_prefix_nums[2] +  aligned_prefix_nums[3];
+    aligned_prefix_nums[2] =  aligned_prefix_nums[3];
+    aligned_prefix_nums[3] =  0;
+    // printf("aligned_size:%d\n",aligned_size);
+    // printf("\n");
+    // for (int i = 0; i < LEVEL; ++i) {
+    //     printf("prefix_nums[%d]: %d ", i, prefix_nums[i]);
+    // }
+    // printf("\n");
+    // for (int i = 0; i < LEVEL; ++i) {
+    //     printf("aligned_prefix_nums[%d]: %u ", i, aligned_prefix_nums[i]);
+    // }
+    // printf("\n");
+    // for (int i = 0; i < LEVEL; ++i) {
+    //     printf("aligned_strides[%d]: %u ", i, aligned_strides[i]);
+    // }
+    // printf("\n\n");
+    // printf("Aligned buffer size: %zu bytes\n", aligned_size);
 }
 
 }

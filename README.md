@@ -28,7 +28,7 @@ PRISM offers several key features:
 You can compile and install PRISM with the following commands.
 
 ```
-git clone https://github.com/BingluCS/PRISM.git
+git clone https://github.com/hpdps-group/PRISM.git
 cd PRISM
 mkdir build && cd build
 cmake ..

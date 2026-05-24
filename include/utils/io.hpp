@@ -64,7 +64,7 @@ typedef struct Buffer {
         len = lx * ly * lz;
         sty = lx;
         stz = lx * ly;
-        bytes = tsize * len + align;
+        bytes = tsize * (len + align);
         CHECK_CUDA(cudaMallocHost(&h, bytes));
         CHECK_CUDA(cudaMalloc(&d, bytes));
         CHECK_CUDA(cudaMemset(d, 0, bytes));
@@ -73,6 +73,8 @@ typedef struct Buffer {
 } inBuffer;
 
 struct Bitplane : Buffer {
+    int* prefix_sum_d;
+    int* aligned_prefix_sum_d;
     int* aligned_strides_d;
     uint32_t lx{1}, ly{1}, lz{1};
     size_t len{1}, aligned_len{1};
@@ -81,6 +83,7 @@ struct Bitplane : Buffer {
     int strides[4]{0, 0, 0, 0};
     int aligned_strides[4]{0, 0, 0, 0};
     int prefix_nums[4]{0, 0, 0, 0};
+    int aligned_prefix_nums[4]{0, 0, 0, 0};
     int compressed_size[4][32];
 
     Bitplane(int x, int y, int z) : lx(x), ly(y), lz(z) {
@@ -112,21 +115,26 @@ struct Bitplane : Buffer {
             ++level;
         }
         prefix_nums[LEVEL] = 0;
+        int anchor_size = prefix_nums[3];
+
         prefix_nums[0] -=  prefix_nums[3];
         prefix_nums[1] -=  prefix_nums[3];
         prefix_nums[2] -=  prefix_nums[3];
         prefix_nums[3] -=  prefix_nums[3];
 
         for(int i = LEVEL - 2; i >= 0; --i) {
-            align += 8 - ((prefix_nums[i] - prefix_nums[i+1] + align) % 8);
+            align += (8 - ((prefix_nums[i] - prefix_nums[i+1] + align) % 8)) % 8;
             prefix_nums[i] += align;
         }
-
-        align += 8 - ((len - prefix_nums[0] + align) % 8);
+        // for (int i = 0; i < LEVEL; ++i) {
+        //     printf("prefix_nums[%d]: %u ", i, prefix_nums[i]);
+        // }
+        align += (8 - ((len - anchor_size - prefix_nums[0] + align) % 8)) % 8;
+        // printf("%lu %lu \n", len, align);
         strides[3] = (prefix_nums[2] - prefix_nums[3]) >> 3;
         strides[2] = (prefix_nums[1] - prefix_nums[2]) >> 3;
         strides[1] = (prefix_nums[0] - prefix_nums[1]) >> 3;
-        strides[0] = (len - prefix_nums[0] + align) >> 3;
+        strides[0] = (len - anchor_size - prefix_nums[0] + align) >> 3;
         aligned_len += align;
         
     }

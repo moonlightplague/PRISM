@@ -4,7 +4,7 @@
 #include "parameters.hpp"
 #include "io.hpp"
 #include "timer.hpp"
-
+#include <array>
 namespace prism{
 
 
