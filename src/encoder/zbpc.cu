@@ -56,6 +56,7 @@ Sponsor: This code is based upon work supported by the U.S. Department of Energy
 #include "d_zero_elimination.hpp"
 #include "zbpc.hpp"
 #include "RZE.hpp"
+#include "err.hpp"
 
 #define DEFAULT_BLOCK_SIZE 384
 using Bitplane = prism::Bitplane;
@@ -155,11 +156,6 @@ static inline __device__ void g2s(void* const __restrict__ destination, const vo
 
 
 static __device__ unsigned long long g_chunk_counter;
-
-static __global__ void d_reset()
-{
-  g_chunk_counter = 0LL;
-}
 
 static inline __device__ void propagate_block(const int value, const long long chunkID, volatile int* const __restrict__ fullcarry, long long* const __restrict__ s_fullc)
 {
@@ -543,19 +539,19 @@ size_t lossless_encode(Bitplane* bp,  uint8_t*& compressed_bp, size_t*& compress
     cudaMalloc((void **)&d_encsize, sizeof(size_t));
     cudaMalloc((void **)&d_fullcarry, chunks * sizeof(int));
 
-    d_reset<<<1, 1>>>();
-    cudaMemset(d_fullcarry, 0, chunks * sizeof(int));
+    unsigned long long zero = 0;
+    CHECK_CUDA(cudaMemcpyToSymbolAsync(g_chunk_counter, &zero, sizeof(zero), 0, cudaMemcpyHostToDevice, (cudaStream_t)stream));
+    CHECK_CUDA(cudaMemsetAsync(d_fullcarry, 0, chunks * sizeof(int), (cudaStream_t)stream));
+    CHECK_CUDA(cudaStreamSynchronize((cudaStream_t)stream));
+    CHECK_CUDA(cudaFuncSetAttribute(zbpc_encode, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
 
     GPUTimer dtimer;
     dtimer.start(stream);
     zbpc_encode<<<DEFAULT_BLOCK_SIZE, TPB, 0, (cudaStream_t)stream>>>
     ((uint8_t*)bp->d, bp->aligned_size, compressed_bp, d_encsize, bp->aligned_strides_d, compressedSize_bp_d, d_fullcarry);
+    CHECK_CUDA(cudaGetLastError());
     time = dtimer.stop(stream);
 
-    // cudaError_t err = cudaGetLastError();
-    // if (err != cudaSuccess) {
-    //     printf("CUDA encode kernel launch error: %s\n", cudaGetErrorString(err));
-    // }
     size_t dencsize = 0;
     cudaMemcpy(&dencsize, d_encsize, sizeof(size_t), cudaMemcpyDeviceToHost);
     // cudaMemcpy(&compressedSize_bp[0][0], compressedSize_bp_d, 4 * 32 * sizeof(size_t), cudaMemcpyDeviceToHost);
@@ -592,18 +588,18 @@ size_t lossless_decode(uint8_t*& compressed_bp, Bitplane* bp, size_t ori_size, d
     // cudaFree(d_decoded_dummy);
     // cudaFree(d_decsize_dummy);
 
+    unsigned long long zero = 0;
+    CHECK_CUDA(cudaMemcpyToSymbolAsync(g_chunk_counter, &zero, sizeof(zero), 0, cudaMemcpyHostToDevice, (cudaStream_t)stream));
+    CHECK_CUDA(cudaStreamSynchronize((cudaStream_t)stream));
+    CHECK_CUDA(cudaFuncSetAttribute(zbpc_decode, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
+
     // time GPU decoding
     GPUTimer dtimer;
     dtimer.start(stream);
-    d_reset<<<1, 1>>>();
     zbpc_decode<<<DEFAULT_BLOCK_SIZE, TPB, 0, (cudaStream_t)stream>>>(input, reinterpret_cast<uint8_t*>(bp->d), d_decsize, bp->aligned_strides_d);
+    CHECK_CUDA(cudaGetLastError());
     time = dtimer.stop(stream);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("CUDA decode kernel launch error: %s\n", cudaGetErrorString(err));
-    }
-    
     // *output = d_decoded;
     return 0;
 }
@@ -633,18 +629,19 @@ double& time, void* stream) {
     // cudaFree(d_decoded_dummy);
     // cudaFree(d_decsize_dummy);
 
+    unsigned long long zero = 0;
+    CHECK_CUDA(cudaMemcpyToSymbolAsync(g_chunk_counter, &zero, sizeof(zero), 0, cudaMemcpyHostToDevice, (cudaStream_t)stream));
+    CHECK_CUDA(cudaStreamSynchronize((cudaStream_t)stream));
+    CHECK_CUDA(cudaFuncSetAttribute(zbpc_decode_progressive, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
+
     // time GPU decoding
     GPUTimer dtimer;
     dtimer.start(stream);
-    d_reset<<<1, 1>>>();
     zbpc_decode_progressive<<<DEFAULT_BLOCK_SIZE, TPB, 0, (cudaStream_t)stream>>>(input, reinterpret_cast<uint8_t*>(bp->d), 
     d_decsize, bp->aligned_strides_d, begin, end);
+    CHECK_CUDA(cudaGetLastError());
     time = dtimer.stop(stream);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("CUDA progressive decode kernel launch error: %s\n", cudaGetErrorString(err));
-    }
     // *output = d_decoded;
     return 0;
 }

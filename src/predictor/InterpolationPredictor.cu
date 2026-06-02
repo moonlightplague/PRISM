@@ -2291,6 +2291,8 @@ uint32_t radius, interpolation_parameters& intp_param, Buffer* profiling_errors,
     int best_idx;  
 
     GPUTimer dtimer;
+    CHECK_CUDA(cudaFuncSetAttribute(auto_tuning_interpolation<T, FP, 4, SPLINE_DIM_3, BLOCK16, BLOCK16, BLOCK16, 1, 1, 1>,
+        cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
     dtimer.start(stream);
     auto_tuning_interpolation<T, FP, 4, SPLINE_DIM_3, BLOCK16, BLOCK16, BLOCK16, 1, 1, 1>
     <<<dim3(block_num, 6, 1), dim3(DEFAULT_BLOCK_SIZE, 1, 1), 0, (cudaStream_t)stream>>>
@@ -2354,6 +2356,8 @@ uint32_t radius, interpolation_parameters& intp_param, Buffer* profiling_errors,
     intp_param.use_md[0] = (best_idx ==  14);
     intp_param.reverse[0] = best_idx%3;
 
+    CHECK_CUDA(cudaFuncSetAttribute(interpolation<T, E, FP, 4, SPLINE_DIM_3, BLOCK16, BLOCK16, BLOCK16, 1, 1, 1>,
+        cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
     dtimer.start(stream);
     interpolation<T, E, FP, 4, SPLINE_DIM_3, BLOCK16, BLOCK16, BLOCK16, 1, 1, 1>
     <<<grid_dim, dim3(DEFAULT_BLOCK_SIZE, 1, 1), 0, (cudaStream_t)stream>>>

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "err.hpp"
 #include <vector>
 #include <chrono>
 #define CREATE_GPUEVENT_PAIR \
@@ -24,8 +25,8 @@
 struct GPUTimer
 {
   cudaEvent_t beg, end;
-  GPUTimer() {cudaEventCreate(&beg); cudaEventCreate(&end);}
+  GPUTimer() {CHECK_CUDA(cudaEventCreate(&beg)); CHECK_CUDA(cudaEventCreate(&end));}
   ~GPUTimer() {cudaEventDestroy(beg); cudaEventDestroy(end);}
-  void start(void* stream) {cudaEventRecord(beg, (cudaStream_t)stream);}
-  double stop(void* stream) {cudaEventRecord(end, (cudaStream_t)stream); cudaEventSynchronize(end); float ms; cudaEventElapsedTime(&ms, beg, end); return ms;}
+  void start(void* stream) {CHECK_CUDA(cudaEventRecord(beg, (cudaStream_t)stream));}
+  double stop(void* stream) {CHECK_CUDA(cudaEventRecord(end, (cudaStream_t)stream)); CHECK_CUDA(cudaEventSynchronize(end)); float ms; CHECK_CUDA(cudaEventElapsedTime(&ms, beg, end)); return ms;}
 };
