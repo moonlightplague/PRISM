@@ -1902,27 +1902,30 @@ __device__ void testing_interpolation(
     int radius,
     interpolation_parameters intp_param)
 {
+    FP base_ebx2 = ebx2 / 2.0;
+    FP base_eb_r = eb_r * 2.0;
+
     auto calc_eb = [&](auto unit, FP &cur_eb_r, FP &cur_ebx2) {
-        cur_ebx2 = ebx2;
-        cur_eb_r = eb_r;
+        cur_ebx2 = base_ebx2;
+        cur_eb_r = base_eb_r;
         int temp = 1;
         while(temp < unit){
             temp *= 2;
             cur_eb_r *= intp_param.alpha;
             cur_ebx2 /= intp_param.alpha;
         }
-        if(cur_ebx2 < ebx2 / intp_param.beta){
-            cur_ebx2 = ebx2 / intp_param.beta;
-            cur_eb_r = eb_r * intp_param.beta;
+        if(cur_ebx2 < base_ebx2 / intp_param.beta){
+            cur_ebx2 = base_ebx2 / intp_param.beta;
+            cur_eb_r = base_eb_r * intp_param.beta;
         }
     };
 
     testing_interpolation_prefill<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
         numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
-        (s_data, s_ectrl, data_size, eb_r, ebx2, radius);
+        (s_data, s_ectrl, data_size, base_eb_r, base_ebx2, radius);
 
-    FP cur_eb_r = eb_r;
-    FP cur_ebx2 = ebx2;
+    FP cur_eb_r = base_eb_r;
+    FP cur_ebx2 = base_ebx2;
     calc_eb(4, cur_eb_r, cur_ebx2);
     testing_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
         numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
