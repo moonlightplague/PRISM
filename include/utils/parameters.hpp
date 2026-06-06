@@ -16,6 +16,7 @@ struct interpolation_parameters
     //
     bool reverse[4];
     uint8_t auto_tuning{3};
+    bool test_interpolation{false};
 
     //
     interpolation_parameters() : use_md{true, true, true, true}, 
@@ -51,6 +52,7 @@ typedef struct prism_context {
     btype bt{SM};
     std::vector<double> target_ebs;
     interpolation_parameters intp_param;
+    bool test{false};
     int* begin;
     int* end;
 } context;
