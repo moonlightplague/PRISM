@@ -1768,6 +1768,175 @@ __forceinline__ __device__ void interpolate_stage_md(
 }
 
 
+template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__forceinline__ __device__ void testing_reconstruct_point(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    int x,
+    int y,
+    int z,
+    T1 pred,
+    FP eb_r,
+    FP ebx2,
+    int radius)
+{
+    if (!xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x, y, z, data_size)) {
+        return;
+    }
+
+    auto global_x = BIX * AnchorBlockSizeX * numAnchorBlockX + x;
+    auto global_y = BIY * AnchorBlockSizeY * numAnchorBlockY + y;
+    auto global_z = BIZ * AnchorBlockSizeZ * numAnchorBlockZ + z;
+    auto data_gid = global_x + global_y * data_size.x + global_z * data_size.x * data_size.y;
+
+    if CONSTEXPR (WORKFLOW == SPLINE3_COMPR) {
+        auto err = s_data[z][y][x] - pred;
+        decltype(err) code;
+        code = fabs(err) * eb_r + 1;
+        code = err < 0 ? -code : code;
+        code = int(code / 2) + radius;
+        s_ectrl[data_gid] = code;
+        s_data[z][y][x] = pred + (code - radius) * ebx2;
+    }
+    else {
+        auto code = s_ectrl[data_gid];
+        s_data[z][y][x] = pred + (code - radius) * ebx2;
+    }
+}
+
+template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__forceinline__ __device__ void testing_interpolation_prefill(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    FP eb_r,
+    FP ebx2,
+    int radius)
+{
+    constexpr auto X_SIZE = AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1);
+    constexpr auto Y_SIZE = AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2);
+    constexpr auto Z_SIZE = AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3);
+    constexpr auto TOTAL = X_SIZE * Y_SIZE * Z_SIZE;
+
+    for (auto _tix = TIX; _tix < TOTAL; _tix += LINEAR_BLOCK_SIZE) {
+        auto x = _tix % X_SIZE;
+        auto y = (_tix / X_SIZE) % Y_SIZE;
+        auto z = (_tix / X_SIZE) / Y_SIZE;
+        bool is_anchor = (x % AnchorBlockSizeX == 0) and
+                         (y % AnchorBlockSizeY == 0) and
+                         (z % AnchorBlockSizeZ == 0);
+        if (!is_anchor) {
+            testing_reconstruct_point<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+                numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+                (s_data, s_ectrl, data_size, x, y, z, T1(0), eb_r, ebx2, radius);
+        }
+    }
+    __syncthreads();
+}
+
+template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__forceinline__ __device__ void testing_interpolation_stage(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    int interval,
+    FP eb_r,
+    FP ebx2,
+    int radius)
+{
+    constexpr auto X_LAST = AnchorBlockSizeX * numAnchorBlockX;
+    constexpr auto Y_SIZE = AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2);
+    constexpr auto Z_SIZE = AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3);
+    auto num_intervals = X_LAST / interval;
+    auto total = num_intervals * 3 * Y_SIZE * Z_SIZE;
+
+    for (auto _tix = TIX; _tix < total; _tix += LINEAR_BLOCK_SIZE) {
+        auto quarter = _tix % 3 + 1;
+        auto interval_id = (_tix / 3) % num_intervals;
+        auto y = (_tix / (3 * num_intervals)) % Y_SIZE;
+        auto z = (_tix / (3 * num_intervals)) / Y_SIZE;
+        auto x0 = interval_id * interval;
+        auto x1 = x0 + interval;
+        auto x = x0 + quarter * (interval / 4);
+
+        bool valid = xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x, y, z, data_size) and
+            xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x0, y, z, data_size) and
+            xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x1, y, z, data_size);
+
+        if (valid) {
+            auto a = s_data[z][y][x0];
+            auto b = s_data[z][y][x1];
+            auto pred = ((4 - quarter) * a + quarter * b) / 4;
+            testing_reconstruct_point<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+                numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+                (s_data, s_ectrl, data_size, x, y, z, pred, eb_r, ebx2, radius);
+        }
+    }
+    __syncthreads();
+}
+
+template<typename T1, typename T2, typename FP, int LEVEL, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__device__ void testing_interpolation(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    FP eb_r,
+    FP ebx2,
+    int radius,
+    interpolation_parameters intp_param)
+{
+    FP base_ebx2 = ebx2 / 2.0;
+    FP base_eb_r = eb_r * 2.0;
+
+    auto calc_eb = [&](auto unit, FP &cur_eb_r, FP &cur_ebx2) {
+        cur_ebx2 = base_ebx2;
+        cur_eb_r = base_eb_r;
+        int temp = 1;
+        while(temp < unit){
+            temp *= 2;
+            cur_eb_r *= intp_param.alpha;
+            cur_ebx2 /= intp_param.alpha;
+        }
+        if(cur_ebx2 < base_ebx2 / intp_param.beta){
+            cur_ebx2 = base_ebx2 / intp_param.beta;
+            cur_eb_r = base_eb_r * intp_param.beta;
+        }
+    };
+
+    testing_interpolation_prefill<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, base_eb_r, base_ebx2, radius);
+
+    FP cur_eb_r = base_eb_r;
+    FP cur_ebx2 = base_ebx2;
+    calc_eb(4, cur_eb_r, cur_ebx2);
+    testing_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, 16, cur_eb_r, cur_ebx2, radius);
+
+    calc_eb(1, cur_eb_r, cur_ebx2);
+    testing_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, 4, cur_eb_r, cur_ebx2, radius);
+}
+
 template<typename T1, typename T2, typename FP, int LEVEL, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
 int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
 __device__ void spline_layout_interpolate(volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
@@ -1783,6 +1952,13 @@ __device__ void spline_layout_interpolate(volatile T1 s_data[AnchorBlockSizeZ * 
     int         radius,
     interpolation_parameters intp_param)
     {
+    if (intp_param.test_interpolation) {
+        testing_interpolation<T1, T2, FP, LEVEL, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+            (s_data, s_ectrl, data_size, eb_r, ebx2, radius, intp_param);
+        return;
+    }
+
     auto xblue = [] __device__(int _tix, int unit) -> int { return unit * (_tix * 2); };
     auto yblue = [] __device__(int _tiy, int unit) -> int { return unit * (_tiy * 2); };
     auto zblue = [] __device__(int _tiz, int unit) -> int { return unit * (_tiz * 2 + 1); };
@@ -2291,70 +2467,73 @@ uint32_t radius, interpolation_parameters& intp_param, Buffer* profiling_errors,
     int best_idx;  
 
     GPUTimer dtimer;
-    CHECK_CUDA(cudaFuncSetAttribute(auto_tuning_interpolation<T, FP, 4, SPLINE_DIM_3, BLOCK16, BLOCK16, BLOCK16, 1, 1, 1>,
-        cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
-    dtimer.start(stream);
-    auto_tuning_interpolation<T, FP, 4, SPLINE_DIM_3, BLOCK16, BLOCK16, BLOCK16, 1, 1, 1>
-    <<<dim3(block_num, 6, 1), dim3(DEFAULT_BLOCK_SIZE, 1, 1), 0, (cudaStream_t)stream>>>
-    (reinterpret_cast<T*>(input->d), input->template len3<dim3>(), input->template st3<dim3>(), 
-    dim3(s_start_x, s_start_y, s_start_z), dim3(s_size_x, s_size_y, s_size_z), 
-    dim3(S_STRIDE, S_STRIDE, S_STRIDE), eb_r, ebx2, intp_param, reinterpret_cast<T*>(profiling_errors->d), true);
-    time = dtimer.stop(stream);
+    time = 0;
+    if(!intp_param.test_interpolation){
+        CHECK_CUDA(cudaFuncSetAttribute(auto_tuning_interpolation<T, FP, 4, SPLINE_DIM_3, BLOCK16, BLOCK16, BLOCK16, 1, 1, 1>,
+            cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
+        dtimer.start(stream);
+        auto_tuning_interpolation<T, FP, 4, SPLINE_DIM_3, BLOCK16, BLOCK16, BLOCK16, 1, 1, 1>
+        <<<dim3(block_num, 6, 1), dim3(DEFAULT_BLOCK_SIZE, 1, 1), 0, (cudaStream_t)stream>>>
+        (reinterpret_cast<T*>(input->d), input->template len3<dim3>(), input->template st3<dim3>(), 
+        dim3(s_start_x, s_start_y, s_start_z), dim3(s_size_x, s_size_y, s_size_z), 
+        dim3(S_STRIDE, S_STRIDE, S_STRIDE), eb_r, ebx2, intp_param, reinterpret_cast<T*>(profiling_errors->d), true);
+        time = dtimer.stop(stream);
 
-    profiling_errors->D2H();
-    auto errors = reinterpret_cast<T*>(profiling_errors->h);
-
-
-    if(errors[0] > errors[1]){
-        best_error = errors[1];
-        intp_param.reverse[3] = true;
-    }
-    else{
-        best_error = errors[0];
-        intp_param.reverse[3] = false;
-    }
-    
-    //printf("use_md[3] errors[2]=%f, best_error=%f\n", errors[2], best_error);
-    intp_param.use_md[3] = errors[2] < best_error; 
-    best_error = fmin(errors[2],best_error);
+        profiling_errors->D2H();
+        auto errors = reinterpret_cast<T*>(profiling_errors->h);
 
 
-    if(errors[3] > errors[4]){
-        best_error = errors[4];
-        intp_param.reverse[2] = true;
-    }
-    else{
-        best_error = errors[3];
-        intp_param.reverse[2] = false;
-    }
-    //printf("use_md[2] errors[5]=%f, best_error=%f\n", errors[5], best_error);
-    intp_param.use_md[2] = errors[5] < best_error; 
-    best_error = fmin(errors[5],best_error);
-
-    best_error = errors[6];
-    best_idx = 6; 
-    for(auto i = 6; i < 12; i++){
-        if(errors[i] < best_error){
-        best_error = errors[i];
-        best_idx = i;
+        if(errors[0] > errors[1]){
+            best_error = errors[1];
+            intp_param.reverse[3] = true;
         }
-    }
-    // intp_param.use_natural[1] = best_idx >  8;
-    intp_param.use_md[1] = (best_idx ==  8 or best_idx ==  11) ;
-    intp_param.reverse[1] = best_idx%3;
-
-    best_error = errors[12];
-    best_idx = 12; 
-
-    for(auto i = 12;i<15;i++){
-        if(errors[i]<best_error){
-        best_error=errors[i];
-        best_idx = i;
+        else{
+            best_error = errors[0];
+            intp_param.reverse[3] = false;
         }
+        
+        //printf("use_md[3] errors[2]=%f, best_error=%f\n", errors[2], best_error);
+        intp_param.use_md[3] = errors[2] < best_error; 
+        best_error = fmin(errors[2],best_error);
+
+
+        if(errors[3] > errors[4]){
+            best_error = errors[4];
+            intp_param.reverse[2] = true;
+        }
+        else{
+            best_error = errors[3];
+            intp_param.reverse[2] = false;
+        }
+        //printf("use_md[2] errors[5]=%f, best_error=%f\n", errors[5], best_error);
+        intp_param.use_md[2] = errors[5] < best_error; 
+        best_error = fmin(errors[5],best_error);
+
+        best_error = errors[6];
+        best_idx = 6; 
+        for(auto i = 6; i < 12; i++){
+            if(errors[i] < best_error){
+            best_error = errors[i];
+            best_idx = i;
+            }
+        }
+        // intp_param.use_natural[1] = best_idx >  8;
+        intp_param.use_md[1] = (best_idx ==  8 or best_idx ==  11) ;
+        intp_param.reverse[1] = best_idx%3;
+
+        best_error = errors[12];
+        best_idx = 12; 
+
+        for(auto i = 12;i<15;i++){
+            if(errors[i]<best_error){
+            best_error=errors[i];
+            best_idx = i;
+            }
+        }
+        // intp_param.use_natural[0] = best_idx >  14;
+        intp_param.use_md[0] = (best_idx ==  14);
+        intp_param.reverse[0] = best_idx%3;
     }
-    // intp_param.use_natural[0] = best_idx >  14;
-    intp_param.use_md[0] = (best_idx ==  14);
-    intp_param.reverse[0] = best_idx%3;
 
     CHECK_CUDA(cudaFuncSetAttribute(interpolation<T, E, FP, 4, SPLINE_DIM_3, BLOCK16, BLOCK16, BLOCK16, 1, 1, 1>,
         cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));

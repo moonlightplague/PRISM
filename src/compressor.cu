@@ -134,6 +134,7 @@ template<typename T, typename E>
 void Compressor<T, E>::compress_predict(context* config, StatBuffer<T>* input, void* stream) {
     double eb = config->eb;
     double rel_eb = config->rel_eb;
+    config->intp_param.test_interpolation = config->test;
     spline_construct<T,E,T>(input, ap, qc, bp->d, ol, eb, rel_eb, radius, config->intp_param, profiling_errors, time_pred, stream);
 }
 
@@ -154,7 +155,7 @@ void Compressor<T, E>::compress_merge(context* config, double input_range, void*
 
 template<typename T, typename E>
 void Compressor<T, E>::decompress_pipeline(context* config, StatBuffer<T>* output, void* stream) {
-    assert(config->bt == NB && "please set the non-progressive mode");
+    assert(config->bt == SM && "please set the non-progressive mode");
     decompress_scatter<1>(config, stream);
     if(config->error_mode == REL) {
         config->eb = config->rel_eb * range;
@@ -169,7 +170,7 @@ template<typename T, typename E>
 void Compressor<T, E>::decompress_progressive_pipeline(context* config, StatBuffer<T>* output_old, 
 StatBuffer<T>* output_new, double targetError, double lastError, void* stream) {
     
-    assert(config->bt == SM && "please set the progressive mode");
+    assert(config->bt == NB && "please set the progressive mode");
     if(lastError == 0)
         decompress_scatter<1>(config, stream);
     else  decompress_scatter<0>(config, stream);
@@ -217,6 +218,7 @@ void Compressor<T, E>::decompress_predict(context* config, StatBuffer<T>* output
 
     double eb = config->eb;
     double rel_eb = config->rel_eb;
+    config->intp_param.test_interpolation = config->test;
     spline_reconstruct<T,E,T>(ap, qc, bp->d, ol, output, eb, rel_eb, radius, config->intp_param, itime_pred, stream);
 }
 
@@ -225,6 +227,7 @@ void Compressor<T, E>::decompress_progressive_predict(context* config, StatBuffe
 
     double eb = config->eb;
     double rel_eb = config->rel_eb;
+    config->intp_param.test_interpolation = config->test;
     spline_progressive_reconstruct<T,E,T>(ap, qc, bp->d, ol, output_old, output_new, eb, rel_eb, radius, config->intp_param, itime_pred, stream);
 }
 
