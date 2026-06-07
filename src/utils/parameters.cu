@@ -24,6 +24,9 @@ Options:
   -prog : Enable progressive compression/decompression
   -errors -<nums> <error_1> <error_2> ... : Perform progressive decompression multiple times with gradually decreasing error bounds
   --test : Envoke the testing interpolation method
+  --test-autotune-direction : Enable per-block axis-priority auto tuning for --test
+  --test-fixed-autotune-direction : Enable lightweight axis-priority tuning on the original fixed-axis --test method
+  --no-test-autotune-direction : Disable per-block axis-priority auto tuning for --test
 Examples:
   ./prism -i [oriFilePath] -f -3 [dim_z] [dim_y] [dim_x] -R [errorBound] -z [cmpFilePath] -x [decFilePath] --report time,cr
   ./prism -i [oriFilePath] -d -3 [dim_z] [dim_y] [dim_x] -R [errorBound] -z [cmpFilePath] -x [decFilePath] -prog -errors -2 1e-1 1e-2
@@ -81,6 +84,21 @@ void parse_argv(prism_context* config, int argc, char** argv) {
         }  
         else if (strcmp(argv[i], "--test") == 0) {
             config->test = true;
+        }
+        else if (strcmp(argv[i], "--test-autotune-direction") == 0) {
+            config->test_direction_autotuning = true;
+            config->intp_param.test_direction_autotuning = true;
+        }
+        else if (strcmp(argv[i], "--test-fixed-autotune-direction") == 0 ||
+                 strcmp(argv[i], "--test-autotune-fixed-direction") == 0) {
+            config->test_fixed_direction_autotuning = true;
+            config->intp_param.test_fixed_direction_autotuning = true;
+        }
+        else if (strcmp(argv[i], "--no-test-autotune-direction") == 0) {
+            config->test_direction_autotuning = false;
+            config->test_fixed_direction_autotuning = false;
+            config->intp_param.test_direction_autotuning = false;
+            config->intp_param.test_fixed_direction_autotuning = false;
         }
         else if (strcmp(argv[i], "-A") == 0) {
             // Error bound mode and value

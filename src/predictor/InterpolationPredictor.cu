@@ -1809,6 +1809,709 @@ __forceinline__ __device__ void testing_reconstruct_point(
     }
 }
 
+__forceinline__ __device__ int testing_priority_axis(uint8_t permutation, int rank)
+{
+    switch (permutation) {
+        case 1: return rank == 0 ? 0 : (rank == 1 ? 2 : 1); // X > Z > Y
+        case 2: return rank == 0 ? 1 : (rank == 1 ? 0 : 2); // Y > X > Z
+        case 3: return rank == 0 ? 1 : (rank == 1 ? 2 : 0); // Y > Z > X
+        case 4: return rank == 0 ? 2 : (rank == 1 ? 0 : 1); // Z > X > Y
+        case 5: return rank == 0 ? 2 : (rank == 1 ? 1 : 0); // Z > Y > X
+        default: return rank == 0 ? 0 : (rank == 1 ? 1 : 2); // X > Y > Z
+    }
+}
+
+template <int SPLINE_DIM>
+__forceinline__ __device__ int testing_axis_mask(int x, int y, int z, int unit)
+{
+    int mask = 0;
+    if CONSTEXPR (SPLINE_DIM >= 1) mask |= ((x % (2 * unit)) != 0) ? 1 : 0;
+    if CONSTEXPR (SPLINE_DIM >= 2) mask |= ((y % (2 * unit)) != 0) ? 2 : 0;
+    if CONSTEXPR (SPLINE_DIM >= 3) mask |= ((z % (2 * unit)) != 0) ? 4 : 0;
+    return mask;
+}
+
+__forceinline__ __device__ int testing_line_axis_from_mask(int mask)
+{
+    if (mask & 1) return 0;
+    if (mask & 2) return 1;
+    return 2;
+}
+
+__forceinline__ __device__ int testing_select_priority_axis(int mask, uint8_t permutation)
+{
+    #pragma unroll
+    for (int rank = 0; rank < 3; ++rank) {
+        int axis = testing_priority_axis(permutation, rank);
+        if (mask & (1 << axis)) return axis;
+    }
+    return testing_line_axis_from_mask(mask);
+}
+
+__forceinline__ __device__ int testing_popcount3(int mask)
+{
+    return (mask & 1) + ((mask >> 1) & 1) + ((mask >> 2) & 1);
+}
+
+__forceinline__ __device__ bool testing_fixed_axis_available(int coord, int interval)
+{
+    int offset = coord % interval;
+    int quarter_step = interval / 4;
+    return offset != 0 && offset % quarter_step == 0;
+}
+
+template <int SPLINE_DIM>
+__forceinline__ __device__ int testing_fixed_interval_axis_mask(int x, int y, int z, int interval)
+{
+    int mask = 0;
+    if CONSTEXPR (SPLINE_DIM >= 1) mask |= testing_fixed_axis_available(x, interval) ? 1 : 0;
+    if CONSTEXPR (SPLINE_DIM >= 2) mask |= testing_fixed_axis_available(y, interval) ? 2 : 0;
+    if CONSTEXPR (SPLINE_DIM >= 3) mask |= testing_fixed_axis_available(z, interval) ? 4 : 0;
+    return mask;
+}
+
+template<typename T, typename FP>
+__forceinline__ __device__ int testing_quantize_signed(T err, FP eb_r)
+{
+    auto code = fabs(err) * eb_r + 1;
+    code = err < 0 ? -code : code;
+    return static_cast<int>(code / 2);
+}
+
+__forceinline__ __device__ int testing_abs_i32(int value)
+{
+    return value < 0 ? -value : value;
+}
+
+__forceinline__ __device__ int testing_bit_width_i32(int value)
+{
+    unsigned int magnitude = static_cast<unsigned int>(testing_abs_i32(value));
+    return magnitude == 0 ? 0 : 32 - __clz(magnitude);
+}
+
+template<typename FP>
+__forceinline__ __device__ void testing_calc_eb(int unit, FP base_eb_r, FP base_ebx2,
+    interpolation_parameters intp_param, FP &cur_eb_r, FP &cur_ebx2)
+{
+    cur_ebx2 = base_ebx2;
+    cur_eb_r = base_eb_r;
+    int temp = 1;
+    while (temp < unit) {
+        temp *= 2;
+        cur_eb_r *= intp_param.alpha;
+        cur_ebx2 /= intp_param.alpha;
+    }
+    if (cur_ebx2 < base_ebx2 / intp_param.beta) {
+        cur_ebx2 = base_ebx2 / intp_param.beta;
+        cur_eb_r = base_eb_r * intp_param.beta;
+    }
+}
+
+template <int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, int AnchorBlockSizeZ,
+int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ>
+__forceinline__ __device__ bool testing_owned_or_anchor_point(int x, int y, int z, DIM3 data_size)
+{
+    if (!xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x, y, z, data_size)) {
+        return false;
+    }
+
+    bool owned = x < AnchorBlockSizeX * numAnchorBlockX + (BIX == GDX - 1) * (SPLINE_DIM >= 1) &&
+        y < AnchorBlockSizeY * numAnchorBlockY + (BIY == GDY - 1) * (SPLINE_DIM >= 2) &&
+        z < AnchorBlockSizeZ * numAnchorBlockZ + (BIZ == GDZ - 1) * (SPLINE_DIM >= 3);
+    bool anchor = (x % AnchorBlockSizeX == 0) && (y % AnchorBlockSizeY == 0) &&
+        (z % AnchorBlockSizeZ == 0);
+    return owned || anchor;
+}
+
+template <typename T1, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ>
+__forceinline__ __device__ T1 testing_predict_axis(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    DIM3 data_size,
+    int x,
+    int y,
+    int z,
+    int axis,
+    int unit)
+{
+    bool left_valid = false;
+    bool right_valid = false;
+    T1 left_value = 0;
+    T1 right_value = 0;
+
+    if (axis == 0) {
+        left_valid = x >= unit && testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+            AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x - unit, y, z, data_size);
+        right_valid = x + unit <= AnchorBlockSizeX * numAnchorBlockX &&
+            testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x + unit, y, z, data_size);
+        if (left_valid) left_value = s_data[z][y][x - unit];
+        if (right_valid) right_value = s_data[z][y][x + unit];
+    }
+    else if (axis == 1) {
+        left_valid = y >= unit && testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+            AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x, y - unit, z, data_size);
+        right_valid = y + unit <= AnchorBlockSizeY * numAnchorBlockY &&
+            testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x, y + unit, z, data_size);
+        if (left_valid) left_value = s_data[z][y - unit][x];
+        if (right_valid) right_value = s_data[z][y + unit][x];
+    }
+    else {
+        left_valid = z >= unit && testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+            AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x, y, z - unit, data_size);
+        right_valid = z + unit <= AnchorBlockSizeZ * numAnchorBlockZ &&
+            testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x, y, z + unit, data_size);
+        if (left_valid) left_value = s_data[z - unit][y][x];
+        if (right_valid) right_value = s_data[z + unit][y][x];
+    }
+
+    if (left_valid && right_valid) return (left_value + right_value) / 2;
+    if (left_valid) return left_value;
+    if (right_valid) return right_value;
+    return T1(0);
+}
+
+template <typename T1, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ>
+__forceinline__ __device__ float testing_score_axis_probe(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    DIM3 data_size,
+    int x,
+    int y,
+    int z,
+    int unit,
+    int axis,
+    FP eb_r)
+{
+    auto pred = testing_predict_axis<T1, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(s_data, data_size, x, y, z, axis, unit);
+    int q = testing_quantize_signed(s_data[z][y][x] - pred, eb_r);
+    int bit_width = testing_bit_width_i32(q);
+    return static_cast<float>(bit_width) + 0.25f * (q != 0) + 2.0f * (bit_width > 8);
+}
+
+template <typename T1, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ>
+__forceinline__ __device__ void testing_accumulate_probe_scores(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    DIM3 data_size,
+    int x,
+    int y,
+    int z,
+    int unit,
+    FP eb_r,
+    float scores[6])
+{
+    if (!testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x, y, z, data_size)) {
+        return;
+    }
+
+    int mask = testing_axis_mask<SPLINE_DIM>(x, y, z, unit);
+    if ((mask & (mask - 1)) == 0) {
+        return;
+    }
+
+    float axis_scores[3] = {1.0e6f, 1.0e6f, 1.0e6f};
+    #pragma unroll
+    for (int axis = 0; axis < 3; ++axis) {
+        if (mask & (1 << axis)) {
+            axis_scores[axis] = testing_score_axis_probe<T1, FP, SPLINE_DIM, AnchorBlockSizeX,
+                AnchorBlockSizeY, AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>
+                (s_data, data_size, x, y, z, unit, axis, eb_r);
+        }
+    }
+
+    #pragma unroll
+    for (int permutation = 0; permutation < 6; ++permutation) {
+        scores[permutation] += axis_scores[testing_select_priority_axis(mask, permutation)];
+    }
+}
+
+template <typename T1, typename FP, int LEVEL, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ>
+__forceinline__ __device__ uint8_t testing_tune_direction_priority(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    DIM3 data_size,
+    FP base_eb_r,
+    FP base_ebx2,
+    interpolation_parameters intp_param)
+{
+    float scores[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    FP cur_eb_r = base_eb_r;
+    FP cur_ebx2 = base_ebx2;
+    testing_calc_eb(8, base_eb_r, base_ebx2, intp_param, cur_eb_r, cur_ebx2);
+    testing_accumulate_probe_scores<T1, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(s_data, data_size, 0, 8, 8, 8, cur_eb_r, scores);
+    testing_accumulate_probe_scores<T1, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(s_data, data_size, 8, 0, 8, 8, cur_eb_r, scores);
+    testing_accumulate_probe_scores<T1, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(s_data, data_size, 8, 8, 0, 8, cur_eb_r, scores);
+    testing_accumulate_probe_scores<T1, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(s_data, data_size, 8, 8, 8, 8, cur_eb_r, scores);
+
+    float best_score = scores[0];
+    uint8_t best_permutation = 0;
+    #pragma unroll
+    for (uint8_t permutation = 1; permutation < 6; ++permutation) {
+        if (scores[permutation] < best_score) {
+            best_score = scores[permutation];
+            best_permutation = permutation;
+        }
+    }
+
+    return best_permutation;
+}
+
+template <typename T1, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ>
+__forceinline__ __device__ bool testing_fixed_axis_prediction(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    DIM3 data_size,
+    int x,
+    int y,
+    int z,
+    int axis,
+    int interval,
+    T1 &pred)
+{
+    int coord = axis == 0 ? x : (axis == 1 ? y : z);
+    int offset = coord % interval;
+    int quarter_step = interval / 4;
+    if (offset == 0 || offset % quarter_step != 0) {
+        return false;
+    }
+
+    int quarter = offset / quarter_step;
+    int coord0 = coord - offset;
+    int coord1 = coord0 + interval;
+    int x0 = x, y0 = y, z0 = z;
+    int x1 = x, y1 = y, z1 = z;
+    if (axis == 0) {
+        x0 = coord0;
+        x1 = coord1;
+    }
+    else if (axis == 1) {
+        y0 = coord0;
+        y1 = coord1;
+    }
+    else {
+        z0 = coord0;
+        z1 = coord1;
+    }
+
+    bool valid = false;
+    if (axis == 0) {
+        valid = xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x0, y0, z0, data_size) &&
+            xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x1, y1, z1, data_size);
+    }
+    else {
+        valid = testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x0, y0, z0, data_size) &&
+            testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x1, y1, z1, data_size);
+    }
+    if (!valid) {
+        return false;
+    }
+
+    auto a = s_data[z0][y0][x0];
+    auto b = s_data[z1][y1][x1];
+    pred = ((4 - quarter) * a + quarter * b) / 4;
+    return true;
+}
+
+template <typename T1, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ>
+__forceinline__ __device__ void testing_fixed_accumulate_probe_scores(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    DIM3 data_size,
+    int x,
+    int y,
+    int z,
+    int interval,
+    FP eb_r,
+    float scores[6])
+{
+    if (!testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x, y, z, data_size)) {
+        return;
+    }
+
+    int mask = testing_fixed_interval_axis_mask<SPLINE_DIM>(x, y, z, interval);
+    if ((mask & (mask - 1)) == 0) {
+        return;
+    }
+
+    float axis_scores[3] = {1.0e6f, 1.0e6f, 1.0e6f};
+    #pragma unroll
+    for (int axis = 0; axis < 3; ++axis) {
+        if (mask & (1 << axis)) {
+            T1 pred = 0;
+            if (testing_fixed_axis_prediction<T1, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+                AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>
+                (s_data, data_size, x, y, z, axis, interval, pred)) {
+                int q = testing_quantize_signed(s_data[z][y][x] - pred, eb_r);
+                int bit_width = testing_bit_width_i32(q);
+                axis_scores[axis] = static_cast<float>(bit_width) + 0.25f * (q != 0) +
+                    2.0f * (bit_width > 8);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int permutation = 0; permutation < 6; ++permutation) {
+        float selected_score = 1.0e6f;
+        #pragma unroll
+        for (int rank = 0; rank < 3; ++rank) {
+            int axis = testing_priority_axis(permutation, rank);
+            if ((mask & (1 << axis)) && axis_scores[axis] < 1.0e6f) {
+                selected_score = axis_scores[axis];
+                break;
+            }
+        }
+        scores[permutation] += selected_score;
+    }
+}
+
+template <typename T1, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ>
+__forceinline__ __device__ uint8_t testing_fixed_tune_direction_priority(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    DIM3 data_size,
+    FP eb_r)
+{
+    float scores[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    testing_fixed_accumulate_probe_scores<T1, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+        AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>
+        (s_data, data_size, 6, 6, 4, 4, eb_r, scores);
+    testing_fixed_accumulate_probe_scores<T1, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+        AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>
+        (s_data, data_size, 6, 4, 6, 4, eb_r, scores);
+    testing_fixed_accumulate_probe_scores<T1, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+        AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>
+        (s_data, data_size, 6, 6, 6, 4, eb_r, scores);
+
+    float best_score = scores[0];
+    uint8_t best_permutation = 0;
+    #pragma unroll
+    for (uint8_t permutation = 1; permutation < 6; ++permutation) {
+        if (scores[permutation] < best_score) {
+            best_score = scores[permutation];
+            best_permutation = permutation;
+        }
+    }
+    return best_score < scores[0] * 0.25f ? best_permutation : 0;
+}
+
+template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__forceinline__ __device__ void testing_interpolation_prefill(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    FP eb_r,
+    FP ebx2,
+    int radius);
+
+template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__forceinline__ __device__ void testing_interpolation_prefill_owned_write(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    FP eb_r,
+    FP ebx2,
+    int radius)
+{
+    constexpr auto X_SIZE = AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1);
+    constexpr auto Y_SIZE = AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2);
+    constexpr auto Z_SIZE = AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3);
+    constexpr auto TOTAL = X_SIZE * Y_SIZE * Z_SIZE;
+
+    for (auto _tix = TIX; _tix < TOTAL; _tix += LINEAR_BLOCK_SIZE) {
+        auto x = _tix % X_SIZE;
+        auto y = (_tix / X_SIZE) % Y_SIZE;
+        auto z = (_tix / X_SIZE) / Y_SIZE;
+        bool is_anchor = (x % AnchorBlockSizeX == 0) and
+                         (y % AnchorBlockSizeY == 0) and
+                         (z % AnchorBlockSizeZ == 0);
+        if (is_anchor || !xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x, y, z, data_size)) {
+            continue;
+        }
+
+        auto global_x = BIX * AnchorBlockSizeX * numAnchorBlockX + x;
+        auto global_y = BIY * AnchorBlockSizeY * numAnchorBlockY + y;
+        auto global_z = BIZ * AnchorBlockSizeZ * numAnchorBlockZ + z;
+        auto data_gid = global_x + global_y * data_size.x + global_z * data_size.x * data_size.y;
+
+        if CONSTEXPR (WORKFLOW == SPLINE3_COMPR) {
+            auto err = s_data[z][y][x];
+            decltype(err) code;
+            code = fabs(err) * eb_r + 1;
+            code = err < 0 ? -code : code;
+            code = int(code / 2) + radius;
+            if (testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+                numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x, y, z, data_size)) {
+                s_ectrl[data_gid] = code;
+            }
+            s_data[z][y][x] = (code - radius) * ebx2;
+        }
+        else {
+            auto code = s_ectrl[data_gid];
+            s_data[z][y][x] = (code - radius) * ebx2;
+        }
+    }
+    __syncthreads();
+}
+
+template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__forceinline__ __device__ void testing_fixed_priority_interpolation_stage(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    int interval,
+    FP eb_r,
+    FP ebx2,
+    int radius,
+    uint8_t permutation,
+    int target_popcount)
+{
+    constexpr auto Y_SIZE = AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2);
+    constexpr auto Z_SIZE = AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3);
+    constexpr auto X_LAST = AnchorBlockSizeX * numAnchorBlockX;
+    auto num_intervals = X_LAST / interval;
+    auto total = num_intervals * 3 * Y_SIZE * Z_SIZE;
+
+    for (auto _tix = TIX; _tix < total; _tix += LINEAR_BLOCK_SIZE) {
+        auto quarter = _tix % 3 + 1;
+        auto interval_id = (_tix / 3) % num_intervals;
+        auto y = (_tix / (3 * num_intervals)) % Y_SIZE;
+        auto z = (_tix / (3 * num_intervals)) / Y_SIZE;
+        auto x = interval_id * interval + quarter * (interval / 4);
+
+        if (!testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x, y, z, data_size)) {
+            continue;
+        }
+
+        int mask = testing_fixed_interval_axis_mask<SPLINE_DIM>(x, y, z, interval);
+        if (testing_popcount3(mask) != target_popcount) {
+            continue;
+        }
+
+        int axis = testing_select_priority_axis(mask, permutation);
+        T1 pred = 0;
+        if (testing_fixed_axis_prediction<T1, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+            AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>
+            (s_data, data_size, x, y, z, axis, interval, pred)) {
+            testing_reconstruct_point<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+                numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+                (s_data, s_ectrl, data_size, x, y, z, pred, eb_r, ebx2, radius);
+        }
+    }
+    __syncthreads();
+}
+
+template<typename T1, typename T2, typename FP, int LEVEL, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__device__ void testing_fixed_priority_interpolation(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    FP eb_r,
+    FP ebx2,
+    int radius,
+    interpolation_parameters intp_param)
+{
+    constexpr double TEST_FIXED_DIRECTION_EB_SCALE = 0.999;
+    FP base_ebx2 = ebx2 / 2.0 * TEST_FIXED_DIRECTION_EB_SCALE;
+    FP base_eb_r = eb_r * 2.0 / TEST_FIXED_DIRECTION_EB_SCALE;
+    __shared__ uint8_t selected_permutation;
+
+    auto calc_eb = [&](auto unit, FP &cur_eb_r, FP &cur_ebx2) {
+        testing_calc_eb(unit, base_eb_r, base_ebx2, intp_param, cur_eb_r, cur_ebx2);
+    };
+
+    auto block_id = BIX + BIY * GDX + BIZ * GDX * GDY;
+    if (TIX == 0) {
+        if CONSTEXPR (WORKFLOW == SPLINE3_COMPR) {
+            FP tune_eb_r = base_eb_r;
+            FP tune_ebx2 = base_ebx2;
+            calc_eb(1, tune_eb_r, tune_ebx2);
+            selected_permutation = testing_fixed_tune_direction_priority<T1, FP, SPLINE_DIM,
+                AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY,
+                numAnchorBlockZ>(s_data, data_size, tune_eb_r);
+            if (intp_param.test_direction_permutations) {
+                intp_param.test_direction_permutations[block_id] = selected_permutation;
+            }
+        }
+        else {
+            selected_permutation = intp_param.test_direction_permutations ?
+                intp_param.test_direction_permutations[block_id] : 0;
+        }
+    }
+    __syncthreads();
+
+    testing_interpolation_prefill_owned_write<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, base_eb_r, base_ebx2, radius);
+
+    FP cur_eb_r = base_eb_r;
+    FP cur_ebx2 = base_ebx2;
+    calc_eb(4, cur_eb_r, cur_ebx2);
+    #pragma unroll
+    for (int target_popcount = 1; target_popcount <= SPLINE_DIM; ++target_popcount) {
+        testing_fixed_priority_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+            AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+            (s_data, s_ectrl, data_size, 16, cur_eb_r, cur_ebx2, radius, selected_permutation, target_popcount);
+    }
+
+    calc_eb(1, cur_eb_r, cur_ebx2);
+    #pragma unroll
+    for (int target_popcount = 1; target_popcount <= SPLINE_DIM; ++target_popcount) {
+        testing_fixed_priority_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+            AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+            (s_data, s_ectrl, data_size, 4, cur_eb_r, cur_ebx2, radius, selected_permutation, target_popcount);
+    }
+}
+
+template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, typename LAMBDA,
+bool LINE, bool FACE, bool CUBE, bool WORKFLOW>
+__forceinline__ __device__ void testing_priority_interpolation_stage(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    LAMBDA xyzmap,
+    int unit,
+    FP eb_r,
+    FP ebx2,
+    int radius,
+    uint8_t permutation,
+    int num_ele)
+{
+    for (auto _tix = TIX; _tix < num_ele; _tix += LINEAR_BLOCK_SIZE) {
+        auto [x, y, z] = xyzmap(_tix, unit);
+        if (testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x, y, z, data_size)) {
+            int mask = testing_axis_mask<SPLINE_DIM>(x, y, z, unit);
+            int axis = LINE ? testing_line_axis_from_mask(mask) : testing_select_priority_axis(mask, permutation);
+            auto pred = testing_predict_axis<T1, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+                numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(s_data, data_size, x, y, z, axis, unit);
+            testing_reconstruct_point<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+                numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+                (s_data, s_ectrl, data_size, x, y, z, pred, eb_r, ebx2, radius);
+        }
+    }
+    __syncthreads();
+}
+
+template<typename T1, typename T2, typename FP, int LEVEL, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__device__ void testing_priority_interpolation(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    FP eb_r,
+    FP ebx2,
+    int radius,
+    interpolation_parameters intp_param)
+{
+    constexpr double TEST_DIRECTION_EB_SCALE = 0.999;
+    FP base_ebx2 = ebx2 * TEST_DIRECTION_EB_SCALE;
+    FP base_eb_r = eb_r / TEST_DIRECTION_EB_SCALE;
+    __shared__ uint8_t selected_permutation;
+
+    auto block_id = BIX + BIY * GDX + BIZ * GDX * GDY;
+    if (TIX == 0) {
+        if CONSTEXPR (WORKFLOW == SPLINE3_COMPR) {
+            selected_permutation = testing_tune_direction_priority<T1, FP, LEVEL, SPLINE_DIM, AnchorBlockSizeX,
+                AnchorBlockSizeY, AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>
+                (s_data, data_size, base_eb_r, base_ebx2, intp_param);
+            if (intp_param.test_direction_permutations) {
+                intp_param.test_direction_permutations[block_id] = selected_permutation;
+            }
+        }
+        else {
+            selected_permutation = intp_param.test_direction_permutations ?
+                intp_param.test_direction_permutations[block_id] : 0;
+        }
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int unit = AnchorBlockSizeX / 2; unit >= 1; unit /= 2) {
+        FP cur_eb_r = base_eb_r;
+        FP cur_ebx2 = base_ebx2;
+        testing_calc_eb(unit, base_eb_r, base_ebx2, intp_param, cur_eb_r, cur_ebx2);
+
+        int n_x = AnchorBlockSizeX / (unit * 2);
+        int n_y = AnchorBlockSizeY / (unit * 2);
+        int n_z = AnchorBlockSizeZ / (unit * 2);
+        int n_line = n_x * (n_y + 1) * (n_z + 1) + (n_x + 1) * n_y * (n_z + 1) +
+            (n_x + 1) * (n_y + 1) * n_z;
+        int n_face = n_x * n_y * (n_z + 1) + n_x * (n_y + 1) * n_z + (n_x + 1) * n_y * n_z;
+        int n_cube = n_x * n_y * n_z;
+
+        if CONSTEXPR (SPLINE_DIM >= 1) {
+            testing_priority_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+                AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ,
+                decltype(xyzmap_line<SPLINE_DIM, AnchorBlockSizeX>), true, false, false, WORKFLOW>
+                (s_data, s_ectrl, data_size, xyzmap_line<SPLINE_DIM, AnchorBlockSizeX>, unit,
+                cur_eb_r, cur_ebx2, radius, selected_permutation, n_line);
+        }
+        if CONSTEXPR (SPLINE_DIM >= 2) {
+            testing_priority_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+                AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ,
+                decltype(xyzmap_face<SPLINE_DIM, AnchorBlockSizeX>), false, true, false, WORKFLOW>
+                (s_data, s_ectrl, data_size, xyzmap_face<SPLINE_DIM, AnchorBlockSizeX>, unit,
+                cur_eb_r, cur_ebx2, radius, selected_permutation, n_face);
+        }
+        if CONSTEXPR (SPLINE_DIM >= 3) {
+            testing_priority_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+                AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ,
+                decltype(xyzmap_cube<SPLINE_DIM, AnchorBlockSizeX>), false, false, true, WORKFLOW>
+                (s_data, s_ectrl, data_size, xyzmap_cube<SPLINE_DIM, AnchorBlockSizeX>, unit,
+                cur_eb_r, cur_ebx2, radius, selected_permutation, n_cube);
+        }
+    }
+}
+
 template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
 int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
 __forceinline__ __device__ void testing_interpolation_prefill(
@@ -1902,6 +2605,20 @@ __device__ void testing_interpolation(
     int radius,
     interpolation_parameters intp_param)
 {
+    if (intp_param.test_fixed_direction_autotuning) {
+        testing_fixed_priority_interpolation<T1, T2, FP, LEVEL, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+            (s_data, s_ectrl, data_size, eb_r, ebx2, radius, intp_param);
+        return;
+    }
+
+    if (intp_param.test_direction_autotuning) {
+        testing_priority_interpolation<T1, T2, FP, LEVEL, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+            (s_data, s_ectrl, data_size, eb_r, ebx2, radius, intp_param);
+        return;
+    }
+
     FP base_ebx2 = ebx2 / 2.0;
     FP base_eb_r = eb_r * 2.0;
 

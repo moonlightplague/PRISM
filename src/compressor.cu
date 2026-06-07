@@ -71,6 +71,7 @@ Compressor<T,E>::~Compressor() {
     delete bp;
     delete compressed_data;
     delete profiling_errors;
+    delete test_direction_permutations;
     // cudaFree(compressed_bp);
     cudaFree(compressedSize_bp_d);
 }
@@ -110,8 +111,19 @@ void Compressor<T,E>::init(prism_context* config) {
     ol = new olBuffer<T>(config->dtype, 0, 0);
     compressed_data = new Buffer(I4, 32, x, y, z);
     profiling_errors = new Buffer(config->dtype, 0, 18, 1, 1);
+    test_direction_permutations = nullptr;
+    test_direction_metadata_bytes = 0;
+    config->intp_param.test_interpolation = config->test;
+    config->intp_param.test_direction_autotuning = config->test_direction_autotuning;
+    config->intp_param.test_fixed_direction_autotuning = config->test_fixed_direction_autotuning;
+    config->intp_param.test_direction_permutations = nullptr;
+    if (config->test && (config->test_direction_autotuning || config->test_fixed_direction_autotuning)) {
+        test_direction_permutations = new Buffer(U1, 0, div(x, BLOCK_SIZE), div(y, BLOCK_SIZE), div(z, BLOCK_SIZE));
+        test_direction_metadata_bytes = test_direction_permutations->bytes;
+        config->intp_param.test_direction_permutations = reinterpret_cast<uint8_t*>(test_direction_permutations->d);
+    }
     bp = new Bitplane(x, y, z);
-    HEADERSIZE = 8 + sizeof(double) + 4 * 32 * sizeof(size_t)  + ap->bytes;
+    HEADERSIZE = 8 + sizeof(double) + 4 * 32 * sizeof(size_t) + ap->bytes + test_direction_metadata_bytes;
     this->begin = config->begin;
     this->end = config->end;
     cudaMalloc(&compressedSize_bp_d, sizeof(size_t) * 4 * 32);
@@ -135,6 +147,10 @@ void Compressor<T, E>::compress_predict(context* config, StatBuffer<T>* input, v
     double eb = config->eb;
     double rel_eb = config->rel_eb;
     config->intp_param.test_interpolation = config->test;
+    config->intp_param.test_direction_autotuning = config->test_direction_autotuning;
+    config->intp_param.test_fixed_direction_autotuning = config->test_fixed_direction_autotuning;
+    config->intp_param.test_direction_permutations = test_direction_permutations ?
+        reinterpret_cast<uint8_t*>(test_direction_permutations->d) : nullptr;
     spline_construct<T,E,T>(input, ap, qc, bp->d, ol, eb, rel_eb, radius, config->intp_param, profiling_errors, time_pred, stream);
 }
 
@@ -148,6 +164,10 @@ void Compressor<T, E>::compress_merge(context* config, double input_range, void*
     CHECK_CUDA(cudaMemcpy(compressed_ptr + 8, &input_range, sizeof(double), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpyAsync(compressed_ptr + 8 + sizeof(double), compressedSize_bp_d, 4 * 32 * 8, cudaMemcpyDeviceToDevice, (cudaStream_t)stream));
     CHECK_CUDA(cudaMemcpyAsync(compressed_ptr + 8 + 4 * 32 * 8 + sizeof(double), ap->d, ap->bytes, cudaMemcpyDeviceToDevice, (cudaStream_t)stream));
+    if (test_direction_metadata_bytes > 0) {
+        CHECK_CUDA(cudaMemcpyAsync(compressed_ptr + 8 + 4 * 32 * sizeof(size_t) + sizeof(double) + ap->bytes,
+            test_direction_permutations->d, test_direction_metadata_bytes, cudaMemcpyDeviceToDevice, (cudaStream_t)stream));
+    }
     CHECK_CUDA(cudaStreamSynchronize((cudaStream_t)stream));
     // cudaMemcpyAsync((uint8_t*)compressed_data->d + 8 + ap->bytes + 4 * 32 * 8 + sizeof(double), compressed_bp, 
     // compressed_lossless_size, cudaMemcpyDeviceToDevice, (cudaStream_t)stream);
@@ -208,6 +228,11 @@ void Compressor<T, E>::decompress_scatter(context* config, void* stream) {
     CHECK_CUDA(cudaMemcpyAsync(compressedSize_bp_d, compressed_ptr + sizeof(double) + 8, 4 * 32 * sizeof(size_t), cudaMemcpyDeviceToDevice, (cudaStream_t)stream));
     if(init_ap == 1)
         CHECK_CUDA(cudaMemcpyAsync(ap->d, compressed_ptr + 4 * 32 * sizeof(size_t) + sizeof(double) + 8, ap->bytes, cudaMemcpyDeviceToDevice, (cudaStream_t)stream));
+    if (test_direction_metadata_bytes > 0) {
+        CHECK_CUDA(cudaMemcpyAsync(test_direction_permutations->d,
+            compressed_ptr + 4 * 32 * sizeof(size_t) + sizeof(double) + 8 + ap->bytes,
+            test_direction_metadata_bytes, cudaMemcpyDeviceToDevice, (cudaStream_t)stream));
+    }
     CHECK_CUDA(cudaStreamSynchronize((cudaStream_t)stream));
 //     cudaMemcpyAsync(compressed_bp, (uint8_t*)compressed_data->d,
 //     compressed_lossless_size, cudaMemcpyDeviceToDevice, (cudaStream_t)stream);    
@@ -219,6 +244,10 @@ void Compressor<T, E>::decompress_predict(context* config, StatBuffer<T>* output
     double eb = config->eb;
     double rel_eb = config->rel_eb;
     config->intp_param.test_interpolation = config->test;
+    config->intp_param.test_direction_autotuning = config->test_direction_autotuning;
+    config->intp_param.test_fixed_direction_autotuning = config->test_fixed_direction_autotuning;
+    config->intp_param.test_direction_permutations = test_direction_permutations ?
+        reinterpret_cast<uint8_t*>(test_direction_permutations->d) : nullptr;
     spline_reconstruct<T,E,T>(ap, qc, bp->d, ol, output, eb, rel_eb, radius, config->intp_param, itime_pred, stream);
 }
 
@@ -228,6 +257,10 @@ void Compressor<T, E>::decompress_progressive_predict(context* config, StatBuffe
     double eb = config->eb;
     double rel_eb = config->rel_eb;
     config->intp_param.test_interpolation = config->test;
+    config->intp_param.test_direction_autotuning = config->test_direction_autotuning;
+    config->intp_param.test_fixed_direction_autotuning = config->test_fixed_direction_autotuning;
+    config->intp_param.test_direction_permutations = test_direction_permutations ?
+        reinterpret_cast<uint8_t*>(test_direction_permutations->d) : nullptr;
     spline_progressive_reconstruct<T,E,T>(ap, qc, bp->d, ol, output_old, output_new, eb, rel_eb, radius, config->intp_param, itime_pred, stream);
 }
 
