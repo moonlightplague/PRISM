@@ -17,6 +17,9 @@ struct interpolation_parameters
     bool reverse[4];
     uint8_t auto_tuning{3};
     bool test_interpolation{false};
+    bool test_direction_autotuning{false};
+    bool test_fixed_direction_autotuning{false};
+    uint8_t* test_direction_permutations{nullptr};
 
     //
     interpolation_parameters() : use_md{true, true, true, true}, 
@@ -53,6 +56,8 @@ typedef struct prism_context {
     std::vector<double> target_ebs;
     interpolation_parameters intp_param;
     bool test{false};
+    bool test_direction_autotuning{false};
+    bool test_fixed_direction_autotuning{false};
     int* begin;
     int* end;
 } context;

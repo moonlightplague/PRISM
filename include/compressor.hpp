@@ -49,6 +49,7 @@ class Compressor {
         inBuffer* ap; // anchor point
         Buffer* compressed_data;
         Buffer* profiling_errors;
+        Buffer* test_direction_permutations;
         olBuffer<T>* ol; // outlier
         // inBuffer* bitplane;
         Bitplane* bp;
@@ -56,6 +57,7 @@ class Compressor {
         int *begin, *end;
         size_t compressed_lossless_size{0};
         size_t total_compressed_size{0};
+        size_t test_direction_metadata_bytes{0};
         // std::array<std::array<uint8_t*, 32>, 4> compressed_bp;
         std::array<std::array<size_t, 32>, 4> compressedSize_bp;
         size_t* compressedSize_bp_d;
