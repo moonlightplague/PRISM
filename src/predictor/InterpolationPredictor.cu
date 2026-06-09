@@ -2476,20 +2476,22 @@ __device__ void testing_fixed_priority_interpolation(
 
     auto block_id = BIX + BIY * GDX + BIZ * GDX * GDY;
     if (TIX == 0) {
+        selected_permutation = 0;
         if CONSTEXPR (WORKFLOW == SPLINE3_COMPR) {
-            FP tune_eb_r = base_eb_r;
-            FP tune_ebx2 = base_ebx2;
-            calc_eb(1, tune_eb_r, tune_ebx2);
-            selected_permutation = testing_fixed_tune_direction_priority<T1, FP, SPLINE_DIM,
-                AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY,
-                numAnchorBlockZ>(s_data, data_size, tune_eb_r);
-            if (intp_param.test_direction_permutations) {
+            if (intp_param.test_fixed_direction_autotuning && intp_param.test_direction_permutations) {
+                FP tune_eb_r = base_eb_r;
+                FP tune_ebx2 = base_ebx2;
+                calc_eb(1, tune_eb_r, tune_ebx2);
+                selected_permutation = testing_fixed_tune_direction_priority<T1, FP, SPLINE_DIM,
+                    AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY,
+                    numAnchorBlockZ>(s_data, data_size, tune_eb_r);
                 intp_param.test_direction_permutations[block_id] = selected_permutation;
             }
         }
         else {
-            selected_permutation = intp_param.test_direction_permutations ?
-                intp_param.test_direction_permutations[block_id] : 0;
+            if (intp_param.test_fixed_direction_autotuning && intp_param.test_direction_permutations) {
+                selected_permutation = intp_param.test_direction_permutations[block_id];
+            }
         }
     }
     __syncthreads();
@@ -2577,17 +2579,19 @@ __device__ void testing_priority_interpolation(
 
     auto block_id = BIX + BIY * GDX + BIZ * GDX * GDY;
     if (TIX == 0) {
+        selected_permutation = 0;
         if CONSTEXPR (WORKFLOW == SPLINE3_COMPR) {
-            selected_permutation = testing_tune_direction_priority<T1, FP, LEVEL, SPLINE_DIM, AnchorBlockSizeX,
-                AnchorBlockSizeY, AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>
-                (s_data, data_size, base_eb_r, base_ebx2, intp_param);
-            if (intp_param.test_direction_permutations) {
+            if (intp_param.test_direction_autotuning && intp_param.test_direction_permutations) {
+                selected_permutation = testing_tune_direction_priority<T1, FP, LEVEL, SPLINE_DIM, AnchorBlockSizeX,
+                    AnchorBlockSizeY, AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>
+                    (s_data, data_size, base_eb_r, base_ebx2, intp_param);
                 intp_param.test_direction_permutations[block_id] = selected_permutation;
             }
         }
         else {
-            selected_permutation = intp_param.test_direction_permutations ?
-                intp_param.test_direction_permutations[block_id] : 0;
+            if (intp_param.test_direction_autotuning && intp_param.test_direction_permutations) {
+                selected_permutation = intp_param.test_direction_permutations[block_id];
+            }
         }
     }
     __syncthreads();
@@ -2771,9 +2775,9 @@ __device__ void testing_interpolation(
         return;
     }
 
-    testing_x_axis_interpolation<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+    testing_priority_interpolation<T1, T2, FP, LEVEL, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
         numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
-        (s_data, s_ectrl, data_size, eb_r, ebx2, radius, intp_param, FP(1.0));
+        (s_data, s_ectrl, data_size, eb_r, ebx2, radius, intp_param);
 }
 
 template<typename T1, typename T2, typename FP, int LEVEL, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
