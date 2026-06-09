@@ -28,8 +28,8 @@ Options:
   --test-fixed-autotune-direction : Enable lightweight axis-priority tuning on the original fixed-axis --test method
   --no-test-autotune-direction : Disable per-block axis-priority auto tuning for --test
 Examples:
-  ./prism -i [oriFilePath] -f -3 [dim_z] [dim_y] [dim_x] -R [errorBound] -z [cmpFilePath] -x [decFilePath] --report time,cr
-  ./prism -i [oriFilePath] -d -3 [dim_z] [dim_y] [dim_x] -R [errorBound] -z [cmpFilePath] -x [decFilePath] -prog -errors -2 1e-1 1e-2
+  ./prism -i [oriFilePath] -f -3 [dim_x] [dim_y] [dim_z] -R [errorBound] -z [cmpFilePath] -x [decFilePath] --report time,cr
+  ./prism -i [oriFilePath] -d -3 [dim_x] [dim_y] [dim_z] -R [errorBound] -z [cmpFilePath] -x [decFilePath] -prog -errors -2 1e-1 1e-2
 )" << std::endl;
 
 }

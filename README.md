@@ -58,8 +58,8 @@ Options:
   -prog : Enable progressive compression/decompression
   -errors -<nums> <error_1> <error_2> ... : Perform progressive decompression multiple times with gradually decreasing error bounds
 Examples:
-  ./prism -i [oriFilePath] -f -3 [dim_z] [dim_y] [dim_x] -R [errorBound] -z [cmpFilePath] -x [decFilePath] --report time,cr
-  ./prism -i [oriFilePath] -d -3 [dim_z] [dim_y] [dim_x] -R [errorBound] -z [cmpFilePath] -x [decFilePath] -prog -errors -2 1e-1 1e-2
+  ./prism -i [oriFilePath] -f -3 [dim_x] [dim_y] [dim_z] -R [errorBound] -z [cmpFilePath] -x [decFilePath] --report time,cr
+  ./prism -i [oriFilePath] -d -3  [dim_x] [dim_y] [dim_z] -R [errorBound] -z [cmpFilePath] -x [decFilePath] -prog -errors -2 1e-1 1e-2
 ```
 
 Example Commands:
