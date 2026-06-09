@@ -2290,6 +2290,117 @@ __forceinline__ __device__ void testing_interpolation_prefill_owned_write(
     __syncthreads();
 }
 
+template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__forceinline__ __device__ void testing_interpolation_stage(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    int interval,
+    FP eb_r,
+    FP ebx2,
+    int radius);
+
+template<typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__forceinline__ __device__ void testing_x_axis_interpolation(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    FP eb_r,
+    FP ebx2,
+    int radius,
+    interpolation_parameters intp_param,
+    FP eb_scale);
+
+template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__forceinline__ __device__ void testing_fixed_x_axis_interpolation_stage(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    int interval,
+    FP eb_r,
+    FP ebx2,
+    int radius)
+{
+    constexpr auto Y_SIZE = AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2);
+    constexpr auto Z_SIZE = AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3);
+    constexpr auto X_LAST = AnchorBlockSizeX * numAnchorBlockX;
+    auto num_intervals = X_LAST / interval;
+    auto total = num_intervals * 3 * Y_SIZE * Z_SIZE;
+
+    for (auto _tix = TIX; _tix < total; _tix += LINEAR_BLOCK_SIZE) {
+        auto quarter = _tix % 3 + 1;
+        auto interval_id = (_tix / 3) % num_intervals;
+        auto y = (_tix / (3 * num_intervals)) % Y_SIZE;
+        auto z = (_tix / (3 * num_intervals)) / Y_SIZE;
+        auto x0 = interval_id * interval;
+        auto x1 = x0 + interval;
+        auto x = x0 + quarter * (interval / 4);
+
+        if (!testing_owned_or_anchor_point<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ>(x, y, z, data_size)) {
+            continue;
+        }
+
+        bool valid = xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x0, y, z, data_size) &&
+            xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x1, y, z, data_size);
+
+        if (valid) {
+            auto a = s_data[z][y][x0];
+            auto b = s_data[z][y][x1];
+            auto pred = ((4 - quarter) * a + quarter * b) / 4;
+            testing_reconstruct_point<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+                numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+                (s_data, s_ectrl, data_size, x, y, z, pred, eb_r, ebx2, radius);
+        }
+    }
+    __syncthreads();
+}
+
+template<typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__forceinline__ __device__ void testing_fixed_x_axis_interpolation(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    FP eb_r,
+    FP ebx2,
+    int radius,
+    interpolation_parameters intp_param,
+    FP eb_scale)
+{
+    FP base_ebx2 = ebx2 / FP(2.0) * eb_scale;
+    FP base_eb_r = eb_r * FP(2.0) / eb_scale;
+
+    testing_interpolation_prefill_owned_write<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, base_eb_r, base_ebx2, radius);
+
+    FP cur_eb_r = base_eb_r;
+    FP cur_ebx2 = base_ebx2;
+    testing_calc_eb(4, base_eb_r, base_ebx2, intp_param, cur_eb_r, cur_ebx2);
+    testing_fixed_x_axis_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+        AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, 16, cur_eb_r, cur_ebx2, radius);
+
+    testing_calc_eb(1, base_eb_r, base_ebx2, intp_param, cur_eb_r, cur_ebx2);
+    testing_fixed_x_axis_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY,
+        AnchorBlockSizeZ, numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, 4, cur_eb_r, cur_ebx2, radius);
+}
+
 template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
 int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
 __forceinline__ __device__ void testing_fixed_priority_interpolation_stage(
@@ -2382,6 +2493,13 @@ __device__ void testing_fixed_priority_interpolation(
         }
     }
     __syncthreads();
+
+    if (testing_priority_axis(selected_permutation, 0) == 0) {
+        testing_fixed_x_axis_interpolation<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+            (s_data, s_ectrl, data_size, eb_r, ebx2, radius, intp_param, FP(TEST_FIXED_DIRECTION_EB_SCALE));
+        return;
+    }
 
     testing_interpolation_prefill_owned_write<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
         numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
@@ -2545,6 +2663,40 @@ __forceinline__ __device__ void testing_interpolation_prefill(
     __syncthreads();
 }
 
+template<typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
+int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
+__forceinline__ __device__ void testing_x_axis_interpolation(
+    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
+                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
+                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
+    T2* s_ectrl,
+    DIM3 data_size,
+    FP eb_r,
+    FP ebx2,
+    int radius,
+    interpolation_parameters intp_param,
+    FP eb_scale)
+{
+    FP base_ebx2 = ebx2 / FP(2.0) * eb_scale;
+    FP base_eb_r = eb_r * FP(2.0) / eb_scale;
+
+    testing_interpolation_prefill<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, base_eb_r, base_ebx2, radius);
+
+    FP cur_eb_r = base_eb_r;
+    FP cur_ebx2 = base_ebx2;
+    testing_calc_eb(4, base_eb_r, base_ebx2, intp_param, cur_eb_r, cur_ebx2);
+    testing_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, 16, cur_eb_r, cur_ebx2, radius);
+
+    testing_calc_eb(1, base_eb_r, base_ebx2, intp_param, cur_eb_r, cur_ebx2);
+    testing_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, 4, cur_eb_r, cur_ebx2, radius);
+}
+
 template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
 int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
 __forceinline__ __device__ void testing_interpolation_stage(
@@ -2619,39 +2771,9 @@ __device__ void testing_interpolation(
         return;
     }
 
-    FP base_ebx2 = ebx2 / 2.0;
-    FP base_eb_r = eb_r * 2.0;
-
-    auto calc_eb = [&](auto unit, FP &cur_eb_r, FP &cur_ebx2) {
-        cur_ebx2 = base_ebx2;
-        cur_eb_r = base_eb_r;
-        int temp = 1;
-        while(temp < unit){
-            temp *= 2;
-            cur_eb_r *= intp_param.alpha;
-            cur_ebx2 /= intp_param.alpha;
-        }
-        if(cur_ebx2 < base_ebx2 / intp_param.beta){
-            cur_ebx2 = base_ebx2 / intp_param.beta;
-            cur_eb_r = base_eb_r * intp_param.beta;
-        }
-    };
-
-    testing_interpolation_prefill<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+    testing_x_axis_interpolation<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
         numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
-        (s_data, s_ectrl, data_size, base_eb_r, base_ebx2, radius);
-
-    FP cur_eb_r = base_eb_r;
-    FP cur_ebx2 = base_ebx2;
-    calc_eb(4, cur_eb_r, cur_ebx2);
-    testing_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
-        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
-        (s_data, s_ectrl, data_size, 16, cur_eb_r, cur_ebx2, radius);
-
-    calc_eb(1, cur_eb_r, cur_ebx2);
-    testing_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
-        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
-        (s_data, s_ectrl, data_size, 4, cur_eb_r, cur_ebx2, radius);
+        (s_data, s_ectrl, data_size, eb_r, ebx2, radius, intp_param, FP(1.0));
 }
 
 template<typename T1, typename T2, typename FP, int LEVEL, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
