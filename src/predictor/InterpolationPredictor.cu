@@ -1809,82 +1809,164 @@ __forceinline__ __device__ void testing_reconstruct_point(
     }
 }
 
-template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
-int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
-__forceinline__ __device__ void testing_interpolation_prefill(
-    volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
-                       [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
-                       [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
-    T2* s_ectrl,
-    DIM3 data_size,
-    FP eb_r,
-    FP ebx2,
-    int radius)
+template <typename T1>
+__forceinline__ __device__ T1 testing_linear_quarter(T1 a, T1 b, int quarter)
 {
-    constexpr auto X_SIZE = AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1);
-    constexpr auto Y_SIZE = AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2);
-    constexpr auto Z_SIZE = AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3);
-    constexpr auto TOTAL = X_SIZE * Y_SIZE * Z_SIZE;
-
-    for (auto _tix = TIX; _tix < TOTAL; _tix += LINEAR_BLOCK_SIZE) {
-        auto x = _tix % X_SIZE;
-        auto y = (_tix / X_SIZE) % Y_SIZE;
-        auto z = (_tix / X_SIZE) / Y_SIZE;
-        bool is_anchor = (x % AnchorBlockSizeX == 0) and
-                         (y % AnchorBlockSizeY == 0) and
-                         (z % AnchorBlockSizeZ == 0);
-        if (!is_anchor) {
-            testing_reconstruct_point<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
-                numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
-                (s_data, s_ectrl, data_size, x, y, z, T1(0), eb_r, ebx2, radius);
-        }
-    }
-    __syncthreads();
+    return ((4 - quarter) * a + quarter * b) / 4;
 }
 
-template <typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
+template <typename T1>
+__forceinline__ __device__ T1 testing_quadratic_left(T1 a, T1 b, T1 c, int quarter)
+{
+    if (quarter == 1) return (21 * a + 14 * b - 3 * c) / 32;
+    if (quarter == 2) return (3 * a + 6 * b - c) / 8;
+    return (5 * a + 30 * b - 3 * c) / 32;
+}
+
+template <typename T1>
+__forceinline__ __device__ T1 testing_quadratic_right(T1 a, T1 b, T1 c, int quarter)
+{
+    if (quarter == 1) return (-3 * a + 30 * b + 5 * c) / 32;
+    if (quarter == 2) return (-a + 6 * b + 3 * c) / 8;
+    return (-3 * a + 14 * b + 21 * c) / 32;
+}
+
+template <typename T1>
+__forceinline__ __device__ T1 testing_cubic_quarter(T1 a, T1 b, T1 c, T1 d, int quarter)
+{
+    if (quarter == 1) return (-7 * a + 105 * b + 35 * c - 5 * d) / 128;
+    if (quarter == 2) return (-a + 9 * b + 9 * c - d) / 16;
+    return (-5 * a + 35 * b + 105 * c - 7 * d) / 128;
+}
+
+template <int AXIS, typename T1, typename T2, typename FP, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY,
 int AnchorBlockSizeZ, int numAnchorBlockX, int numAnchorBlockY, int numAnchorBlockZ, bool WORKFLOW>
-__forceinline__ __device__ void testing_interpolation_stage(
+__forceinline__ __device__ void testing_interpolation_axis_stage(
     volatile T1 s_data[AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3)]
                        [AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2)]
                        [AnchorBlockSizeX * numAnchorBlockX + (SPLINE_DIM >= 1)],
     T2* s_ectrl,
     DIM3 data_size,
     int interval,
+    int stride_x,
+    int stride_y,
+    int stride_z,
     FP eb_r,
     FP ebx2,
     int radius)
 {
     constexpr auto X_LAST = AnchorBlockSizeX * numAnchorBlockX;
-    constexpr auto Y_SIZE = AnchorBlockSizeY * numAnchorBlockY + (SPLINE_DIM >= 2);
-    constexpr auto Z_SIZE = AnchorBlockSizeZ * numAnchorBlockZ + (SPLINE_DIM >= 3);
-    auto num_intervals = X_LAST / interval;
-    auto total = num_intervals * 3 * Y_SIZE * Z_SIZE;
+    constexpr auto Y_LAST = AnchorBlockSizeY * numAnchorBlockY;
+    constexpr auto Z_LAST = AnchorBlockSizeZ * numAnchorBlockZ;
+
+    constexpr auto AXIS_LAST = (AXIS == 0) ? X_LAST : ((AXIS == 1) ? Y_LAST : Z_LAST);
+    auto num_intervals = AXIS_LAST / interval;
+    auto row_count_a = (AXIS == 0) ? (Y_LAST / stride_y + 1) : (X_LAST / stride_x + 1);
+    auto row_count_b = (AXIS == 2) ? (Y_LAST / stride_y + 1) : (Z_LAST / stride_z + 1);
+    auto total = num_intervals * 3 * row_count_a * row_count_b;
+
+    auto valid = [&](auto x, auto y, auto z) {
+        return xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x, y, z, data_size);
+    };
+    auto at = [&](auto x, auto y, auto z, auto coord) -> T1 {
+        if constexpr (AXIS == 0) return s_data[z][y][coord];
+        if constexpr (AXIS == 1) return s_data[z][coord][x];
+        if constexpr (AXIS == 2) return s_data[coord][y][x];
+    };
 
     for (auto _tix = TIX; _tix < total; _tix += LINEAR_BLOCK_SIZE) {
         auto quarter = _tix % 3 + 1;
         auto interval_id = (_tix / 3) % num_intervals;
-        auto y = (_tix / (3 * num_intervals)) % Y_SIZE;
-        auto z = (_tix / (3 * num_intervals)) / Y_SIZE;
-        auto x0 = interval_id * interval;
-        auto x1 = x0 + interval;
-        auto x = x0 + quarter * (interval / 4);
+        auto row = _tix / (3 * num_intervals);
+        auto row_a = row % row_count_a;
+        auto row_b = row / row_count_a;
 
-        bool valid = xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
-            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x, y, z, data_size) and
-            xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
-            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x0, y, z, data_size) and
-            xyz_predicate<SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
-            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, true>(x1, y, z, data_size);
+        int x = 0, y = 0, z = 0;
+        int p0 = interval_id * interval;
+        int p1 = p0 + interval;
+        int p = p0 + quarter * (interval / 4);
 
-        if (valid) {
-            auto a = s_data[z][y][x0];
-            auto b = s_data[z][y][x1];
-            auto pred = ((4 - quarter) * a + quarter * b) / 4;
-            testing_reconstruct_point<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
-                numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
-                (s_data, s_ectrl, data_size, x, y, z, pred, eb_r, ebx2, radius);
+        if constexpr (AXIS == 0) {
+            x = p;
+            y = row_a * stride_y;
+            z = row_b * stride_z;
         }
+        else if constexpr (AXIS == 1) {
+            x = row_a * stride_x;
+            y = p;
+            z = row_b * stride_z;
+        }
+        else {
+            x = row_a * stride_x;
+            y = row_b * stride_y;
+            z = p;
+        }
+
+        if (!valid(x, y, z)) {
+            continue;
+        }
+
+        int x0 = x, y0 = y, z0 = z;
+        int x1 = x, y1 = y, z1 = z;
+        if constexpr (AXIS == 0) {
+            x0 = p0;
+            x1 = p1;
+        }
+        else if constexpr (AXIS == 1) {
+            y0 = p0;
+            y1 = p1;
+        }
+        else {
+            z0 = p0;
+            z1 = p1;
+        }
+
+        if (!valid(x0, y0, z0)) {
+            continue;
+        }
+
+        auto left = at(x, y, z, p0);
+        auto pred = left;
+        bool has_right = valid(x1, y1, z1);
+        if (has_right) {
+            auto right = at(x, y, z, p1);
+            pred = testing_linear_quarter(left, right, quarter);
+
+            if (interval == 4) {
+                int pm = p0 - interval;
+                int pp = p1 + interval;
+                int xm = x, ym = y, zm = z;
+                int xp = x, yp = y, zp = z;
+                if constexpr (AXIS == 0) {
+                    xm = pm;
+                    xp = pp;
+                }
+                else if constexpr (AXIS == 1) {
+                    ym = pm;
+                    yp = pp;
+                }
+                else {
+                    zm = pm;
+                    zp = pp;
+                }
+                bool has_left_outer = valid(xm, ym, zm);
+                bool has_right_outer = valid(xp, yp, zp);
+                if (has_left_outer and has_right_outer) {
+                    pred = testing_cubic_quarter(at(x, y, z, pm), left, right, at(x, y, z, pp), quarter);
+                }
+                else if (has_right_outer) {
+                    pred = testing_quadratic_left(left, right, at(x, y, z, pp), quarter);
+                }
+                else if (has_left_outer) {
+                    pred = testing_quadratic_right(at(x, y, z, pm), left, right, quarter);
+                }
+            }
+        }
+
+        testing_reconstruct_point<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+            numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+            (s_data, s_ectrl, data_size, x, y, z, pred, eb_r, ebx2, radius);
     }
     __syncthreads();
 }
@@ -1920,21 +2002,40 @@ __device__ void testing_interpolation(
         }
     };
 
-    testing_interpolation_prefill<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
-        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
-        (s_data, s_ectrl, data_size, base_eb_r, base_ebx2, radius);
-
     FP cur_eb_r = base_eb_r;
     FP cur_ebx2 = base_ebx2;
+
     calc_eb(4, cur_eb_r, cur_ebx2);
-    testing_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+    int stride_x = AnchorBlockSizeX * numAnchorBlockX;
+    int stride_y = AnchorBlockSizeY * numAnchorBlockY;
+    int stride_z = AnchorBlockSizeZ * numAnchorBlockZ;
+    testing_interpolation_axis_stage<0, T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
         numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
-        (s_data, s_ectrl, data_size, 16, cur_eb_r, cur_ebx2, radius);
+        (s_data, s_ectrl, data_size, 16, stride_x, stride_y, stride_z, cur_eb_r, cur_ebx2, radius);
+    stride_x = 4;
+    testing_interpolation_axis_stage<1, T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, 16, stride_x, stride_y, stride_z, cur_eb_r, cur_ebx2, radius);
+    stride_y = 4;
+    testing_interpolation_axis_stage<2, T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, 16, stride_x, stride_y, stride_z, cur_eb_r, cur_ebx2, radius);
 
     calc_eb(1, cur_eb_r, cur_ebx2);
-    testing_interpolation_stage<T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+    stride_x = 4;
+    stride_y = 4;
+    stride_z = 4;
+    testing_interpolation_axis_stage<0, T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
         numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
-        (s_data, s_ectrl, data_size, 4, cur_eb_r, cur_ebx2, radius);
+        (s_data, s_ectrl, data_size, 4, stride_x, stride_y, stride_z, cur_eb_r, cur_ebx2, radius);
+    stride_x = 1;
+    testing_interpolation_axis_stage<1, T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, 4, stride_x, stride_y, stride_z, cur_eb_r, cur_ebx2, radius);
+    stride_y = 1;
+    testing_interpolation_axis_stage<2, T1, T2, FP, SPLINE_DIM, AnchorBlockSizeX, AnchorBlockSizeY, AnchorBlockSizeZ,
+        numAnchorBlockX, numAnchorBlockY, numAnchorBlockZ, WORKFLOW>
+        (s_data, s_ectrl, data_size, 4, stride_x, stride_y, stride_z, cur_eb_r, cur_ebx2, radius);
 }
 
 template<typename T1, typename T2, typename FP, int LEVEL, int SPLINE_DIM, int AnchorBlockSizeX, int AnchorBlockSizeY, 
