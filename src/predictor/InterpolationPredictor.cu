@@ -1984,8 +1984,8 @@ __device__ void testing_interpolation(
     int radius,
     interpolation_parameters intp_param)
 {
-    FP base_ebx2 = ebx2 / 2.0;
-    FP base_eb_r = eb_r * 2.0;
+    FP base_ebx2 = ebx2;
+    FP base_eb_r = eb_r;
 
     auto calc_eb = [&](auto unit, FP &cur_eb_r, FP &cur_ebx2) {
         cur_ebx2 = base_ebx2;
