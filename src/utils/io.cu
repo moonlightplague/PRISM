@@ -14,6 +14,30 @@ Buffer::~Buffer() {
     cudaFreeHost(h);
 }
 
+void Buffer::ensure_host_capacity(size_t numBytes) {
+    if (h_capacity >= numBytes && h != nullptr) {
+        return;
+    }
+    if (h) {
+        CHECK_CUDA(cudaFreeHost(h));
+        h = nullptr;
+    }
+    CHECK_CUDA(cudaMallocHost(&h, numBytes));
+    h_capacity = numBytes;
+}
+
+void Buffer::ensure_device_capacity(size_t numBytes) {
+    if (d_capacity >= numBytes && d != nullptr) {
+        return;
+    }
+    if (d) {
+        CHECK_CUDA(cudaFree(d));
+        d = nullptr;
+    }
+    CHECK_CUDA(cudaMalloc(&d, numBytes));
+    d_capacity = numBytes;
+}
+
 template<itype file_type>
 void Buffer::load_fromfile(const std::string filename) {
     std::ifstream file(filename, std::ios::binary);
@@ -24,21 +48,18 @@ void Buffer::load_fromfile(const std::string filename) {
     
     file.seekg(0, std::ios::end);
     auto length = file.tellg();
+    auto file_length = static_cast<size_t>(length);
     file.seekg(0, std::ios::beg);
-    cudaError_t err = cudaMallocHost((void**)&h, length);
-
-    if (err != cudaSuccess) {
-        std::cerr << "cudaMallocHost failed: " << cudaGetErrorString(err) << std::endl;
-        exit(1);
-    }
     if(file_type == ori_File) {
-        if (length < bytes) {
-            std::cerr << "Error: Read " << bytes << " bytes, but expected " << length << " bytes." << std::endl;
+        if (file_length < bytes) {
+            std::cerr << "Error: expected " << bytes << " bytes, but file has " << file_length << " bytes." << std::endl;
             std::cerr << "File read incomplete or corrupted." << std::endl;
             exit(1);
         }
     }
-    else  bytes = length;
+    else  bytes = file_length;
+    ensure_host_capacity(bytes);
+    ensure_device_capacity(bytes);
     // file.seekg(bytes, std::ios::beg);
     file.read(reinterpret_cast<char*>(h), bytes);
     file.close();
@@ -47,7 +68,7 @@ void Buffer::load_fromfile(const std::string filename) {
 
 void Buffer::unload_tofile(const std::string filename, typetofile tf) {
     if(tf == typetofile::deviceTofile) {
-        cudaMallocHost((void**)&h, bytes);
+        ensure_host_capacity(bytes);
         D2H();
     }
 
@@ -63,7 +84,7 @@ void Buffer::unload_tofile(const std::string filename, typetofile tf) {
 
 void Buffer::unload_tofile(const std::string filename, long long numBytes, typetofile tf) {
     if(tf == typetofile::deviceTofile) {
-        cudaMallocHost((void**)&h, numBytes);
+        ensure_host_capacity(numBytes);
         D2H(numBytes);
     }
 
@@ -118,6 +139,12 @@ void Bitplane::bitplane_malloc() {
     cudaMemcpy(aligned_strides_d, aligned_strides, sizeof(int) * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(prefix_sum_d, prefix_nums, sizeof(int) * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(aligned_prefix_sum_d, aligned_prefix_nums, sizeof(int) * 4, cudaMemcpyHostToDevice);
+}
+
+Bitplane::~Bitplane() {
+    if (aligned_strides_d) CHECK_CUDA(cudaFree(aligned_strides_d));
+    if (prefix_sum_d) CHECK_CUDA(cudaFree(prefix_sum_d));
+    if (aligned_prefix_sum_d) CHECK_CUDA(cudaFree(aligned_prefix_sum_d));
 }
 
 void Bitplane::calculate_aligned_buffer_size(size_t alignment = 8) {

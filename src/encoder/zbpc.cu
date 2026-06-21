@@ -563,6 +563,9 @@ size_t lossless_encode(Bitplane* bp,  uint8_t*& compressed_bp, size_t*& compress
     dencsize += padding;
     // compressed_bp = d_encoded;
 
+    CHECK_CUDA(cudaFree(d_encsize));
+    CHECK_CUDA(cudaFree(d_fullcarry));
+
     return dencsize;
 }
 
@@ -599,6 +602,8 @@ size_t lossless_decode(uint8_t*& compressed_bp, Bitplane* bp, size_t ori_size, d
     zbpc_decode<<<DEFAULT_BLOCK_SIZE, TPB, 0, (cudaStream_t)stream>>>(input, reinterpret_cast<uint8_t*>(bp->d), d_decsize, bp->aligned_strides_d);
     CHECK_CUDA(cudaGetLastError());
     time = dtimer.stop(stream);
+
+    CHECK_CUDA(cudaFree(d_decsize));
 
     // *output = d_decoded;
     return 0;
@@ -641,6 +646,8 @@ double& time, void* stream) {
     d_decsize, bp->aligned_strides_d, begin, end);
     CHECK_CUDA(cudaGetLastError());
     time = dtimer.stop(stream);
+
+    CHECK_CUDA(cudaFree(d_decsize));
 
     // *output = d_decoded;
     return 0;

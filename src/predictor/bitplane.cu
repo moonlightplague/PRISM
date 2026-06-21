@@ -675,10 +675,6 @@ int* begin, int* end, double& time, void* stream) {
     dim3 data_size = qc->template len3<dim3>();
     int size = qc->len - anchor_size + bp->align;
     int gridDim = (size- 1) / CS + 1;
-    E* d_tt, *h_t, *h_t_pro;
-    cudaMalloc((void**)&d_tt, bp->aligned_size);
-    cudaMallocHost((void**)&h_t, bp->aligned_size);
-    cudaMallocHost((void**)&h_t_pro, bp->aligned_size);
 
     GPUTimer dtimer;
     dtimer.start(stream);

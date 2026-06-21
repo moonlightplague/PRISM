@@ -24,8 +24,10 @@ typedef struct Buffer {
     size_t sty{1}, stz{1};  // stride
     int align{0};
     //DataLocation dl;
-    void* d;
-    void* h;
+    void* d{nullptr};
+    void* h{nullptr};
+    size_t d_capacity{0};
+    size_t h_capacity{0};
     Buffer() {};
     ~Buffer();
     template<itype file_type>
@@ -36,6 +38,8 @@ typedef struct Buffer {
     void D2H(long long numBytes = -1);
     void H2D_cudaasync(void* stream, long long numBytes = -1);
     void D2H_cudaasync(void* stream, long long numBytes = -1);
+    void ensure_host_capacity(size_t numBytes);
+    void ensure_device_capacity(size_t numBytes);
     
     template<typename D>
     D len3() const {
@@ -67,15 +71,17 @@ typedef struct Buffer {
         bytes = tsize * (len + align);
         CHECK_CUDA(cudaMallocHost(&h, bytes));
         CHECK_CUDA(cudaMalloc(&d, bytes));
+        h_capacity = bytes;
+        d_capacity = bytes;
         CHECK_CUDA(cudaMemset(d, 0, bytes));
     }
 
 } inBuffer;
 
 struct Bitplane : Buffer {
-    int* prefix_sum_d;
-    int* aligned_prefix_sum_d;
-    int* aligned_strides_d;
+    int* prefix_sum_d{nullptr};
+    int* aligned_prefix_sum_d{nullptr};
+    int* aligned_strides_d{nullptr};
     uint32_t lx{1}, ly{1}, lz{1};
     size_t len{1}, aligned_len{1};
     size_t ori_size{1}, aligned_size{1};
@@ -91,15 +97,12 @@ struct Bitplane : Buffer {
         ori_size = aligned_size = len * 4;
         h_comput<4>();
         bitplane_malloc();
-        Buffer(U1, 0, aligned_size);
+        dtype = U1;
+        tsize = 1;
+        bytes = aligned_size;
+        d_capacity = aligned_size;
     }
-    // ~Bitplane() {
-    //     // if (d) cudaFree(d);
-    //     // if (h) cudaFreeHost(h);
-    //     if (d) cudaFree(d);
-    //     if (h) cudaFreeHost(h);
-    //     if (aligned_strides_d) cudaFree(aligned_strides_d);
-    // }
+    ~Bitplane();
     void bitplane_malloc();
     void calculate_aligned_buffer_size(size_t alignment);
 
@@ -141,7 +144,7 @@ struct Bitplane : Buffer {
 
     void unload_tofile(const char* filename, typetofile tf) {
         if(tf == typetofile::deviceTofile) {
-            cudaMallocHost((void**)&h, aligned_size);
+            ensure_host_capacity(aligned_size);
             CHECK_CUDA(cudaMemcpy(h, d, aligned_size, cudaMemcpyDeviceToHost));
         }
 
@@ -159,8 +162,8 @@ struct Bitplane : Buffer {
 
 template<typename T>
 struct olBuffer : Buffer { ///outlier
-    uint32_t *d_idx, *h_idx;
-    uint32_t *d_num, h_num{0};
+    uint32_t *d_idx{nullptr}, *h_idx{nullptr};
+    uint32_t *d_num{nullptr}, h_num{0};
 
     olBuffer(){}
 
